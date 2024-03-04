@@ -1,0 +1,104 @@
+# Define o nome deste fluxo de trabalho (workflow) como "CI".
+name: CI
+
+# Especifica quando este fluxo de trabalho será executado.
+on:
+  # O fluxo de trabalho é ativado quando um push é feito.
+  push:
+    # Especificamente para a branch 'main'.
+    branches:
+      - main
+
+# Define os trabalhos (jobs) que serão executados neste fluxo de trabalho.
+jobs:
+  # Nome do trabalho: "build_and_push".
+  build_and_push:
+    # O trabalho será executado em um runner com Ubuntu mais recente.
+    runs-on: ubuntu-latest
+
+    # Lista de etapas (steps) que serão executadas neste trabalho.
+    steps:
+    # Primeira etapa: Fazer checkout do código fonte.
+    - name: Checkout code
+      # Usa a action "checkout" na versão 2 para fazer checkout do código.
+      uses: actions/checkout@v2
+      with:
+        # Busca todo o histórico do repositório (isso é útil para determinar alterações em commits).
+        fetch-depth: 0
+
+    # Segunda etapa: Determinar quais serviços foram alterados no commit.
+    - name: Determine changed services
+      # Dá um ID a esta etapa para referência futura.
+      id: get_changed_services
+      run: |
+        # Verifica se os commits 'before' e 'sha' existem no repositório.
+        if git cat-file -e ${{ github.event.before }} && git cat-file -e ${{ github.sha }}; then
+          # Usa o 'git diff' para determinar quais arquivos foram alterados entre os dois commits.
+          # Em seguida, processa essa lista para identificar os serviços alterados.
+          changed_services=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | awk -F"/" '{print $1}' | sort -u | paste -sd, -)
+          # Exibe os serviços alterados.
+          echo "Changed services: $changed_services"
+          # Armazena os serviços alterados em uma variável de ambiente.
+          echo "CHANGED_SERVICES=$changed_services" >> $GITHUB_ENV
+        else
+          # Se um dos commits não existir, uma mensagem é exibida.
+          echo "Um ou ambos os commits não existem no repositório."
+          echo "CHANGED_SERVICES=" >> $GITHUB_ENV
+        fi
+
+    # Terceira etapa: Fazer login no DockerHub.
+    - name: Login to DockerHub
+      run: |
+        # Usa a senha armazenada nas secrets do GitHub e faz login no DockerHub com o nome de usuário correspondente.
+        echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+    # Quarta etapa: Construir (build) e enviar (push) os serviços alterados para o DockerHub.
+    - name: Build and push changed services
+      run: |
+        # Define o IFS (Internal Field Separator) como ',' e lê os serviços alterados em um array.
+        IFS=',' read -ra SERVICES <<< "$CHANGED_SERVICES"
+        # Define uma lista de diretórios a serem ignorados.
+        IGNORED_DIRECTORIES=(".github")
+
+        DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}
+
+        # Itera sobre cada serviço alterado.
+        for service in "${SERVICES[@]}"; do
+            # Se o serviço estiver na lista de ignorados, continue para o próximo.
+            if [[ " ${IGNORED_DIRECTORIES[@]} " =~ " ${service} " ]]; then
+                continue
+            fi
+
+            # Exibe qual serviço está sendo processado.
+            echo "Processing $service..."
+
+            # Busca as tags existentes para esse serviço no DockerHub.
+            response=$(curl -s "https://hub.docker.com/v2/repositories/$DOCKER_USERNAME/$service/tags/")
+
+            # Exibe a resposta do DockerHub.
+            echo "Resposta do Docker Hub: $response"
+
+            # Se houver tags para esse serviço.
+            if [[ $(echo "$response" | jq '.count') -gt 0 ]]; then
+                # Busca a maior versão "v[0-9]+".
+                highest_version=$(echo "$response" | jq -r '[.results[].name | select(test("^v[0-9]+$"))] | sort | .[-1]' | sed 's/v//')
+                # Se a versão mais alta foi encontrada, incrementa ela para a próxima.
+                # Caso contrário, define a versão como 1.
+                if [[ ! -z "$highest_version" ]]; then
+                    version=$((highest_version + 1))
+                else
+                    version=1
+                fi
+                # Exibe a versão que será usada.
+                echo "Versão extraída: v$version"
+            else
+                # Se não houver tags, define a versão como 1.
+                version=1
+            fi
+
+            # Constrói a imagem Docker para o serviço e a taggeia com a versão e "latest".
+            docker build -t $DOCKER_USERNAME/$service:v$version -t $DOCKER_USERNAME/$service:latest $service/
+            # Envia (push) ambas as tags (versão e latest) para o DockerHub.
+            docker push $DOCKER_USERNAME/$service:v$version
+            docker push $DOCKER_USERNAME/$service:latest
+        done
